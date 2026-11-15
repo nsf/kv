@@ -153,6 +153,102 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
+// Transact runs fn inside a SQLite transaction: the writes made through tx
+// are committed if fn returns nil and rolled back if it returns an error or
+// panics (the panic propagates after the rollback). See kv.Transactional for
+// the visibility rules of tx.
+//
+// Transactions must not be nested: the tx passed to fn does not implement
+// kv.Transactional, so kv.Transact(tx, ...) reports kv.ErrNotSupported.
+// Using tx after Transact returns reports an error (the underlying
+// *sql.Tx is done).
+//
+// The transaction is started in SQLite's default DEFERRED mode, so a
+// read-modify-write transaction can still fail with SQLITE_BUSY if another
+// writer commits in between; callers with concurrent writers may want to add
+// _txlock=immediate to their DSN.
+func (s *Store) Transact(fn func(tx kv.Store) error) error {
+	if s.err != nil {
+		return s.err
+	}
+
+	sqlTx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("sqlite: begin transaction: %w", err)
+	}
+
+	// Roll back unless the commit below succeeds, so both fn errors and
+	// panics leave the database unchanged.
+	committed := false
+	defer func() {
+		if !committed {
+			sqlTx.Rollback() //nolint:errcheck // best-effort; the tx is being abandoned anyway
+		}
+	}()
+
+	if err := fn(&txStore{tx: sqlTx, q: s.q}); err != nil {
+		return err
+	}
+
+	if err := sqlTx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: commit transaction: %w", err)
+	}
+	committed = true
+
+	return nil
+}
+
+// txStore is the kv.Store view of an open transaction handed to Transact's
+// callback. It runs the same preformatted statements as its parent Store on
+// the transaction's connection, so all writes are atomic with respect to
+// other callers. It deliberately does NOT implement kv.Transactional, which
+// makes nested transactions fail with kv.ErrNotSupported.
+type txStore struct {
+	tx *sql.Tx
+	q  queries
+}
+
+// Get retrieves the value associated with the given key, observing any
+// uncommitted writes made through this transaction.
+// It returns kv.ErrNotFound if the key does not exist.
+func (t *txStore) Get(key string) ([]byte, error) {
+	var value []byte
+	row := t.tx.QueryRow(t.q.selectSQL, key)
+	if err := row.Scan(&value); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, kv.ErrNotFound
+		}
+		return nil, fmt.Errorf("sqlite: tx get %q: %w", key, err)
+	}
+
+	// The driver returns a fresh []byte for each BLOB it scans, so the value
+	// is already unaliased from any other copy of the data.
+	return value, nil
+}
+
+// Set stores the given value within the transaction, overwriting any existing
+// value for the key (including one written earlier in the same transaction).
+// As with Store.Set, a nil value is stored as an empty blob.
+func (t *txStore) Set(key string, value []byte) error {
+	if value == nil {
+		value = []byte{}
+	}
+
+	if _, err := t.tx.Exec(t.q.upsertSQL, key, value); err != nil {
+		return fmt.Errorf("sqlite: tx set %q: %w", key, err)
+	}
+	return nil
+}
+
+// Delete removes the given key within the transaction. Deleting a key that
+// does not exist is not an error.
+func (t *txStore) Delete(key string) error {
+	if _, err := t.tx.Exec(t.q.deleteSQL, key); err != nil {
+		return fmt.Errorf("sqlite: tx delete %q: %w", key, err)
+	}
+	return nil
+}
+
 // checkTable reports whether table is a safe, plain SQL identifier.
 func checkTable(table string) error {
 	if !ident.MatchString(table) {
@@ -161,5 +257,10 @@ func checkTable(table string) error {
 	return nil
 }
 
-// Ensure Store implements kv.Store at compile time.
-var _ kv.Store = (*Store)(nil)
+// Ensure Store implements kv.Store and kv.Transactional, and that the
+// transaction view implements kv.Store, at compile time.
+var (
+	_ kv.Store         = (*Store)(nil)
+	_ kv.Transactional = (*Store)(nil)
+	_ kv.Store         = (*txStore)(nil)
+)

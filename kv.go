@@ -4,12 +4,19 @@ package kv
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 )
 
 // ErrNotFound is returned by Get when the requested key does not exist.
 // Implementations should return it (directly or wrapped via errors.Is) so
 // callers can distinguish a missing key from a genuine read error.
 var ErrNotFound = errors.New("kv: key not found")
+
+// ErrNotSupported is returned when an operation is not supported by a Store
+// implementation (possibly wrapped; check with errors.Is). It is reported by
+// the Transact function when the given Store does not implement
+// Transactional.
+var ErrNotSupported = errors.New("kv: not supported")
 
 // Store is the interface implemented by key/value databases.
 type Store interface {
@@ -24,6 +31,36 @@ type Store interface {
 	// Delete removes the given key and its associated value.
 	// Deleting a key that does not exist is not an error.
 	Delete(key string) error
+}
+
+// Transactional is implemented by backends that can run a unit of work
+// atomically. It is an optional extension of Store, deliberately kept out of
+// the Store interface itself so simple backends need not implement it.
+type Transactional interface {
+	// Transact runs fn inside a transaction. The writes made through tx are
+	// committed if fn returns nil and rolled back if it returns an error or
+	// panics (the panic propagates to the caller after the rollback).
+	//
+	// tx reads observe the store as of the start of the transaction plus any
+	// writes made through tx during fn; those writes are not visible to other
+	// callers until the commit. tx has the same semantics as Store otherwise
+	// (ErrNotFound on missing keys, idempotent Delete, and so on).
+	//
+	// tx must not be used after Transact returns; doing so returns an error.
+	// Transactions must not be nested: calling Transact (or Transact on a
+	// JSONStore wrapping tx) from within fn returns an error.
+	Transact(fn func(tx Store) error) error
+}
+
+// Transact runs fn inside a transaction on s. If s does not implement
+// Transactional, it returns ErrNotSupported (wrapped; check with errors.Is)
+// without calling fn; otherwise it returns exactly what s.Transact returns.
+func Transact(s Store, fn func(tx Store) error) error {
+	t, ok := s.(Transactional)
+	if !ok {
+		return fmt.Errorf("kv: %T does not support transactions: %w", s, ErrNotSupported)
+	}
+	return t.Transact(fn)
 }
 
 // JSONStore wraps a Store and adds JSON encoding/decoding on top of it, so
@@ -74,4 +111,15 @@ func (j JSONStore) Set[T any](key string, value T) error {
 // exist is not an error.
 func (j JSONStore) Delete(key string) error {
 	return j.s.Delete(key)
+}
+
+// Transact runs fn inside a transaction on the underlying Store, wrapping the
+// transaction's Store in a JSONStore so fn can Set and Get typed JSON values
+// atomically. It delegates to the Transact function, so a Store that does not
+// implement Transactional reports ErrNotSupported without calling fn; fn's
+// return value (and the transaction's commit or rollback) is propagated as-is.
+func (j JSONStore) Transact(fn func(tx JSONStore) error) error {
+	return Transact(j.s, func(tx Store) error {
+		return fn(JSONStore{s: tx})
+	})
 }

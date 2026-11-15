@@ -199,6 +199,182 @@ func TestCreateTableIdempotent(t *testing.T) {
 	}
 }
 
+// TestTransact checks commit, rollback, transaction-local visibility,
+// non-nestability, use-after-commit, and the kv.Transact helper.
+func TestTransact(t *testing.T) {
+	s, _ := open(t, "data")
+	if err := s.Set("k", []byte("v")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Commit path: tx sees its own writes (and the committed state), and a
+	// second Set to the same key within the tx overwrites the first.
+	var saved kv.Store
+	err := kv.Transact(s, func(tx kv.Store) error {
+		saved = tx
+
+		got, err := tx.Get("k")
+		if err != nil || string(got) != "v" {
+			t.Errorf("tx.Get(k) = %q, %v; want %q, nil", got, err, "v")
+		}
+		if err := tx.Set("k", []byte("one")); err != nil {
+			return err
+		}
+		if err := tx.Set("k", []byte("two")); err != nil {
+			return err
+		}
+		if err := tx.Set("tmp", []byte("x")); err != nil {
+			return err
+		}
+		if err := tx.Delete("tmp"); err != nil {
+			return err
+		}
+		if _, err := tx.Get("tmp"); !errors.Is(err, kv.ErrNotFound) {
+			t.Errorf("tx.Get(deleted tmp): err = %v, want kv.ErrNotFound", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact: %v", err)
+	}
+	got, err := s.Get("k")
+	if err != nil || string(got) != "two" {
+		t.Fatalf("after commit: k = %q, %v; want %q, nil", got, err, "two")
+	}
+
+	// Using tx after Transact returns must be an error, not a silent read.
+	if _, err := saved.Get("k"); err == nil {
+		t.Fatal("Get on committed tx: err = nil, want an error")
+	}
+
+	// Rollback path: fn's error is passed through unchanged and nothing the
+	// tx wrote is applied.
+	sentinel := errors.New("boom")
+	err = s.Transact(func(tx kv.Store) error {
+		if err := tx.Set("k", []byte("rolled back")); err != nil {
+			return err
+		}
+		if err := tx.Delete("k"); err != nil {
+			return err
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Transact: err = %v, want the sentinel error", err)
+	}
+	got, _ = s.Get("k")
+	if string(got) != "two" {
+		t.Fatalf("after rollback: k = %q, want %q", got, "two")
+	}
+
+	// Nested transactions are not supported: tx does not implement
+	// kv.Transactional, so kv.Transact on it reports kv.ErrNotSupported.
+	err = s.Transact(func(tx kv.Store) error {
+		return kv.Transact(tx, func(kv.Store) error { return nil })
+	})
+	if !errors.Is(err, kv.ErrNotSupported) {
+		t.Fatalf("nested Transact: err = %v, want kv.ErrNotSupported", err)
+	}
+
+	// A Store with an invalid table name reports ErrInvalidTable from
+	// Transact as well, without touching the database.
+	if err := New(s.db, "1bad").Transact(func(kv.Store) error { return nil }); !errors.Is(err, ErrInvalidTable) {
+		t.Fatalf("Transact on invalid table: err = %v, want ErrInvalidTable", err)
+	}
+}
+
+// TestTransactInvisibleUntilCommit checks that uncommitted transaction writes
+// are not visible through the Store while fn is running.
+func TestTransactInvisibleUntilCommit(t *testing.T) {
+	s, _ := open(t, "data")
+
+	err := s.Transact(func(tx kv.Store) error {
+		if err := tx.Set("k", []byte("inside")); err != nil {
+			return err
+		}
+		// The store itself (a different connection) must not see the write.
+		if _, err := s.Get("k"); !errors.Is(err, kv.ErrNotFound) {
+			t.Errorf("Get during tx: err = %v, want kv.ErrNotFound", err)
+		}
+		// The tx must see it.
+		got, err := tx.Get("k")
+		if err != nil || string(got) != "inside" {
+			t.Errorf("tx.Get(k) = %q, %v; want %q, nil", got, err, "inside")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact: %v", err)
+	}
+
+	got, err := s.Get("k")
+	if err != nil || string(got) != "inside" {
+		t.Fatalf("after commit: k = %q, %v; want %q, nil", got, err, "inside")
+	}
+}
+
+// TestTransactPanic checks that a panic in fn rolls the transaction back and
+// propagates to the caller.
+func TestTransactPanic(t *testing.T) {
+	s, _ := open(t, "data")
+	if err := s.Set("k", []byte("v")); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	func() {
+		defer func() {
+			if p := recover(); p == nil {
+				t.Fatal("Transact: want the panic to propagate")
+			}
+		}()
+		if err := s.Transact(func(tx kv.Store) error {
+			if err := tx.Set("k", []byte("changed")); err != nil {
+				t.Fatalf("tx.Set: %v", err)
+			}
+			panic("boom")
+		}); err != nil {
+			t.Fatalf("Transact: %v", err)
+		}
+	}()
+
+	got, err := s.Get("k")
+	if err != nil || string(got) != "v" {
+		t.Fatalf("after panic: k = %q, %v; want %q, nil", got, err, "v")
+	}
+}
+
+// TestJSONStoreTransact checks the JSON-typed transaction wrapper end to end
+// against a real backend.
+func TestJSONStoreTransact(t *testing.T) {
+	s, _ := open(t, "data")
+	j := kv.NewJSONStore(s)
+
+	err := j.Transact(func(tx kv.JSONStore) error {
+		if err := tx.Set("a", map[string]int{"n": 1}); err != nil {
+			return err
+		}
+		got, err := tx.Get[map[string]int]("a")
+		if err != nil {
+			return err
+		}
+		if got["n"] != 1 {
+			t.Errorf("tx.Get(a): n = %d, want 1", got["n"])
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transact: %v", err)
+	}
+
+	got, err := j.Get[map[string]int]("a")
+	if err != nil {
+		t.Fatalf("Get(a): %v", err)
+	}
+	if got["n"] != 1 {
+		t.Fatalf("after commit: a.n = %d, want 1", got["n"])
+	}
+}
+
 func TestInvalidTable(t *testing.T) {
 	s, db := open(t, "data")
 
